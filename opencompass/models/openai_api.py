@@ -21,7 +21,7 @@ from .base_api import BaseAPIModel
 PromptType = Union[PromptList, str]
 OPENAI_API_BASE = os.path.join(
     os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1/'),
-    'chat/completions',
+    'responses',
 )
 OPENAISDK_API_BASE = os.environ.get('OPENAI_BASE_URL',
                                     'https://api.openai.com/v1/')
@@ -286,33 +286,16 @@ class OpenAI(BaseAPIModel):
 
             self.acquire()
             try:
-                if any(model in self.path
-                       for model in OAI_REASONING_MODEL_LIST):
-                    self.logger.warning(
-                        f"'max_token' is unsupported for model {self.path}")
-                    self.logger.warning(
-                        f'We use max_out_len: {max_out_len} for this query')
-                    data = dict(
-                        model=self.path,
-                        messages=messages,
-                        max_completion_tokens=max_out_len,
-                        n=1,
-                        logprobs=self.logprobs,
-                        top_logprobs=self.top_logprobs,
-                        stop=None,
-                        temperature=temperature,
-                    )
-                else:
-                    data = dict(
-                        model=self.path,
-                        messages=messages,
-                        max_tokens=max_out_len,
-                        n=1,
-                        logprobs=self.logprobs,
-                        top_logprobs=self.top_logprobs,
-                        stop=None,
-                        temperature=temperature,
-                    )
+                data = dict(
+                    model=self.path,
+                    input=messages,
+                    max_output_tokens=max_out_len,
+                    temperature=temperature,
+                )
+                if self.logprobs:
+                    data['include'] = ['message.output_text.logprobs']
+                    if self.top_logprobs:
+                        data['top_logprobs'] = self.top_logprobs
                 if self.extra_body:
                     data.update(self.extra_body)
                 if isinstance(self.url, list):
@@ -352,16 +335,46 @@ class OpenAI(BaseAPIModel):
                     continue
                 response = raw_response.json()
                 self.logger.debug(str(response))
-                if self.logprobs:
-                    return response['choices']
-                else:
-                    # Extract content and reasoning_content from response
-                    message = response['choices'][0]['message']
-                    content = message.get('content', '') or ''
-                    reasoning_content = message.get('reasoning_content',
-                                                    '') or ''
 
-                    # Handle reasoning_content similar to OpenAISDK
+                # Check if the response failed
+                if response.get('status') == 'failed':
+                    error = response.get('error', {})
+                    self.logger.error(
+                        'Response failed: %s', str(error))
+                    if error.get('code') == 'rate_limit_exceeded':
+                        time.sleep(10)
+                        self.logger.warning(
+                            'Rate limit exceeded, retrying...')
+                        continue
+                    elif error.get('code') == 'insufficient_quota':
+                        self.invalid_keys.add(key)
+                        self.logger.warning(
+                            f'insufficient_quota key: {key}')
+                        continue
+                    max_num_retries += 1
+                    continue
+
+                if self.logprobs:
+                    return response.get('output', [])
+                else:
+                    # Extract text from output message items
+                    # (output_text is a client-side SDK property,
+                    # not in the raw JSON response)
+                    content = ''
+                    for item in response.get('output', []):
+                        if item.get('type') == 'message':
+                            for part in item.get('content', []):
+                                if part.get('type') == 'output_text':
+                                    content += part.get('text', '')
+
+                    reasoning_content = ''
+                    for item in response.get('output', []):
+                        if item.get('type') == 'reasoning':
+                            for s in item.get('summary', []):
+                                if s.get('type') == 'summary_text':
+                                    reasoning_content += s.get(
+                                        'text', '')
+
                     if reasoning_content:
                         if self.verbose:
                             self.logger.info(
@@ -385,24 +398,24 @@ class OpenAI(BaseAPIModel):
                                   f'{raw_response.content.decode()}')
             except KeyError:
                 if 'error' in response:
-                    if response['error']['code'] == 'rate_limit_exceeded':
+                    error = response['error']
+                    error_code = error.get('code', '')
+                    if error_code == 'rate_limit_exceeded':
                         time.sleep(10)
                         self.logger.warning('Rate limit exceeded, retrying...')
                         continue
-                    elif response['error']['code'] == 'insufficient_quota':
+                    elif error_code == 'insufficient_quota':
                         self.invalid_keys.add(key)
                         self.logger.warning(f'insufficient_quota key: {key}')
                         continue
-                    elif response['error']['code'] == 'invalid_prompt':
-                        self.logger.warning('Invalid prompt:', str(input))
-                        return ''
-                    elif response['error']['type'] == 'invalid_prompt':
+                    elif error_code == 'invalid_prompt' or error.get(
+                            'type') == 'invalid_prompt':
                         self.logger.warning('Invalid prompt:', str(input))
                         return ''
 
                     self.logger.error(
                         'Find error message in response: ',
-                        str(response['error']),
+                        str(error),
                     )
             finally:
                 self.release()
@@ -778,25 +791,22 @@ class OpenAISDK(OpenAI):
         num_retries = 0
         while num_retries < self.retry:
             if any(model in self.path for model in OAI_REASONING_MODEL_LIST):
-                self.logger.warning(
-                    f"'max_token' is unsupported for model {self.path}")
-                self.logger.warning(
-                    f'We use max_out_len: {max_out_len} for this query')
                 query_data = dict(
                     model=self.path,
-                    max_completion_tokens=max_out_len,
-                    n=1,
-                    messages=messages,
+                    input=messages,
+                    max_output_tokens=max_out_len,
                     extra_body=self.extra_body,
                 )
-                query_data['reasoning_effort'] = self.reasoning_effort
+                if self.reasoning_effort:
+                    query_data['reasoning'] = {
+                        'effort': self.reasoning_effort
+                    }
             else:
                 query_data = dict(
                     model=self.path,
-                    max_tokens=max_out_len,
-                    n=1,
+                    input=messages,
+                    max_output_tokens=max_out_len,
                     temperature=self.temperature,
-                    messages=messages,
                     extra_body=self.extra_body,
                 )
 
@@ -808,8 +818,8 @@ class OpenAISDK(OpenAI):
                 if self.verbose:
                     self.logger.info('Start calling OpenAI API')
 
-                responses = self.openai_client.chat.completions.create(
-                    **query_data, timeout=self.timeout)  # timeout in seconds
+                responses = self.openai_client.responses.create(
+                    **query_data, timeout=self.timeout)
                 if self.verbose:
                     self.logger.info(
                         'Successfully get response from OpenAI API '
@@ -818,46 +828,54 @@ class OpenAISDK(OpenAI):
                         self.logger.info(responses)
                     except Exception:
                         pass  # noqa F841
-                # Check if response is empty or content is empty
-                if (not responses.choices or not responses.choices[0].message
-                        or
-                    (not responses.choices[0].message.content and not getattr(
-                        responses.choices[0].message,
-                        'reasoning_content',
-                        '',
-                    ))):  # noqa: E125
-                    # There is case that server does not return any content
-                    if responses.choices[0].finish_reason == 'stop':
-                        self.logger.info(
-                            'Server does not return any content '
-                            'and stop reason is <stop>, '
-                            'the input query is: %s', query_data)
-                        return ''
-                    if responses.choices[0].finish_reason == 'content_filter':
+
+                # Check if the response failed or has no content
+                if responses.status == 'failed':
+                    error = responses.error
+                    self.logger.error(
+                        'Response failed: %s', str(error))
+                    num_retries += 1
+                    continue
+
+                if responses.status == 'incomplete':
+                    reason = getattr(
+                        responses.incomplete_details, 'reason', '')
+                    if reason == 'content_filter':
                         self.logger.info(
                             'The answer for this question is filtered,'
                             'the stop reason is <content_filter>, '
                             'the input query is: %s', query_data)
                         return ''
+
+                content = responses.output_text or ''
+                reasoning_content = ''
+                for item in responses.output:
+                    if item.type == 'reasoning':
+                        for s in (item.summary or []):
+                            if hasattr(s, 'text'):
+                                reasoning_content += s.text
+
+                if not content and not reasoning_content:
+                    if responses.status == 'completed':
+                        self.logger.info(
+                            'Server does not return any content '
+                            'and status is <completed>, '
+                            'the input query is: %s', query_data)
+                        return ''
                     self.logger.error(
                         'Failed to extract content from the responses. '
-                        'Please check the API response for detail information.'
-                        'API responses: %s',
+                        'Please check the API response for detail '
+                        'information. API responses: %s',
                         responses,
                     )
                     num_retries += 1
                     continue
 
-                reasoning_content = (getattr(responses.choices[0].message,
-                                             'reasoning_content', '') or '')
-                content = responses.choices[0].message.content or ''
                 # Concat Reasoning Content and tags to content
                 if reasoning_content:
                     if self.verbose:
                         self.logger.info(
-                            'Follow'
-                            'vllm/reasoning/deepseek_r1_reasoning_parser'
-                            'to parse the reasoning content and tags'
+                            'Extracting reasoning content and tags. '
                             'Reasoning Content: %s, \n'
                             'Tags: %s, \n'
                             'Content: %s',
@@ -1028,27 +1046,29 @@ class OpenAISDKRollout(OpenAI):
         while num_retries < self.retry:
             self.wait()
             if any(model in self.path for model in OAI_REASONING_MODEL_LIST):
-                self.logger.warning(
-                    f"'max_token' is unsupported for model {self.path}")
-                self.logger.warning(
-                    f'We use max_out_len: {max_out_len} for this query')
                 query_data = dict(
                     model=self.path,
-                    max_completion_tokens=max_out_len,
-                    n=1,
-                    messages=messages,
+                    input=messages,
+                    max_output_tokens=max_out_len,
+                    include=['message.output_text.logprobs'],
                     extra_body=self.extra_body,
                 )
-                query_data['reasoning_effort'] = self.reasoning_effort
+                if self.reasoning_effort:
+                    query_data['reasoning'] = {
+                        'effort': self.reasoning_effort
+                    }
             else:
                 query_data = dict(
                     model=self.path,
-                    max_tokens=max_out_len,
-                    n=1,
+                    input=messages,
+                    max_output_tokens=max_out_len,
                     temperature=self.temperature,
-                    messages=messages,
+                    include=['message.output_text.logprobs'],
                     extra_body=self.extra_body,
                 )
+
+            if self.top_logprobs:
+                query_data['top_logprobs'] = self.top_logprobs
 
             if self.openai_extra_kwargs:
                 query_data.update(self.openai_extra_kwargs)
@@ -1064,29 +1084,34 @@ class OpenAISDKRollout(OpenAI):
                 if self.verbose:
                     self.logger.info('Start calling OpenAI API')
 
-                responses = self.openai_client.chat.completions.create(
+                responses = self.openai_client.responses.create(
                     **query_data,
-                    timeout=timeout,
-                    logprobs=True,
-                    top_logprobs=self.top_logprobs)  # timeout in seconds
+                    timeout=timeout)
 
-                if not responses.choices[0].logprobs or not responses.choices[
-                        0].logprobs.content:
+                # Extract logprobs from output message items
+                logprobs_content = None
+                for item in responses.output:
+                    if item.type == 'message':
+                        for content_part in item.content:
+                            if (content_part.type == 'output_text'
+                                    and content_part.logprobs):
+                                logprobs_content = content_part.logprobs
+                                break
+                        if logprobs_content:
+                            break
+
+                if not logprobs_content:
                     token_logprobs = None
                     sum_neg_logprob = 0.0
                     num_tokens = 0
                 else:
                     token_logprobs = [
-                        c.logprob
-                        for c in responses.choices[0].logprobs.content
+                        c.logprob for c in logprobs_content
                     ]
                     sum_neg_logprob = -float(sum(token_logprobs))
                     num_tokens = len(token_logprobs)
 
-                if not responses.choices[0].finish_reason:
-                    finish_reason = 'error'
-                else:
-                    finish_reason = responses.choices[0].finish_reason
+                finish_reason = responses.status or 'error'
                 rollout = dict(
                     token_logprobs=token_logprobs,
                     sum_neg_logprob=sum_neg_logprob,
@@ -1102,46 +1127,54 @@ class OpenAISDKRollout(OpenAI):
                         self.logger.info(responses)
                     except Exception:
                         pass  # noqa F841
-                # Check if response is empty or content is empty
-                if (not responses.choices or not responses.choices[0].message
-                        or
-                    (not responses.choices[0].message.content and not getattr(
-                        responses.choices[0].message,
-                        'reasoning_content',
-                        '',
-                    ))):  # noqa: E125
-                    # There is case that server does not return any content
-                    if responses.choices[0].finish_reason == 'stop':
-                        self.logger.info(
-                            'Server does not return any content '
-                            'and stop reason is <stop>, '
-                            'the input query is: %s', query_data)
-                        return ''
-                    if responses.choices[0].finish_reason == 'content_filter':
+
+                # Check if the response failed or has no content
+                if responses.status == 'failed':
+                    error = responses.error
+                    self.logger.error(
+                        'Response failed: %s', str(error))
+                    num_retries += 1
+                    continue
+
+                if responses.status == 'incomplete':
+                    reason = getattr(
+                        responses.incomplete_details, 'reason', '')
+                    if reason == 'content_filter':
                         self.logger.info(
                             'The answer for this question is filtered,'
                             'the stop reason is <content_filter>, '
                             'the input query is: %s', query_data)
                         return ''
+
+                content = responses.output_text or ''
+                reasoning_content = ''
+                for item in responses.output:
+                    if item.type == 'reasoning':
+                        for s in (item.summary or []):
+                            if hasattr(s, 'text'):
+                                reasoning_content += s.text
+
+                if not content and not reasoning_content:
+                    if responses.status == 'completed':
+                        self.logger.info(
+                            'Server does not return any content '
+                            'and status is <completed>, '
+                            'the input query is: %s', query_data)
+                        return ''
                     self.logger.error(
                         'Failed to extract content from the responses. '
-                        'Please check the API response for detail information.'
-                        'API responses: %s',
+                        'Please check the API response for detail '
+                        'information. API responses: %s',
                         responses,
                     )
                     num_retries += 1
                     continue
 
-                reasoning_content = (getattr(responses.choices[0].message,
-                                             'reasoning_content', '') or '')
-                content = responses.choices[0].message.content or ''
                 # Concat Reasoning Content and tags to content
                 if reasoning_content:
                     if self.verbose:
                         self.logger.info(
-                            'Follow'
-                            'vllm/reasoning/deepseek_r1_reasoning_parser'
-                            'to parse the reasoning content and tags'
+                            'Extracting reasoning content and tags. '
                             'Reasoning Content: %s, \n'
                             'Tags: %s, \n'
                             'Content: %s',

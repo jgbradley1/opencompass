@@ -187,6 +187,14 @@ def parse_args():
         type=str,
         default=None,
     )
+    parser.add_argument(
+        '--limit',
+        help='Limit the number of samples to load per dataset '
+        'for quick testing/debugging. If set, only the first n '
+        'samples will be read.',
+        type=int,
+        default=None,
+    )
 
     # set srun args
     slurm_parser = parser.add_argument_group('slurm_args')
@@ -327,6 +335,23 @@ def main():
         existing_results_list = read_from_station(cfg, args)
         rs_exist_results = [comb['combination'] for comb in existing_results_list]
         cfg['rs_exist_results'] = rs_exist_results
+
+    # Apply --limit to all datasets
+    if args.limit is not None:
+        limit_range = f'[:{args.limit}]'
+        for dataset in cfg['datasets']:
+            if 'reader_cfg' not in dataset:
+                dataset['reader_cfg'] = {}
+            dataset['reader_cfg']['test_range'] = limit_range
+            # Also propagate into evaluator's nested dataset_cfg if present
+            eval_ds_cfg = (dataset.get('eval_cfg', {})
+                           .get('evaluator', {})
+                           .get('dataset_cfg', None))
+            if eval_ds_cfg is not None:
+                if 'reader_cfg' not in eval_ds_cfg:
+                    eval_ds_cfg['reader_cfg'] = {}
+                eval_ds_cfg['reader_cfg']['test_range'] = limit_range
+        logger.info(f'Limiting each dataset to the first {args.limit} test samples.')
 
     # report to lark bot if specify --lark
     if not args.lark:

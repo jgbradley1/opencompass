@@ -16,3 +16,5 @@ volcengine-python-sdk
 websocket-client
 # zhipu
 zhipuai
+# microsoft agent framework
+agent-framework

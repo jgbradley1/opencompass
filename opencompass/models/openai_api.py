@@ -661,7 +661,7 @@ class OpenAISDK(OpenAI):
         meta_template: Dict | None = None,
         openai_api_base: str | List[str] = OPENAISDK_API_BASE,
         azure_endpoint: Optional[str] = None,
-        azure_api_version: Optional[str] = '2024-12-01-preview',
+        azure_api_version: Optional[str] = '2025-03-01-preview',
         openai_proxy_url: Optional[str] = None,
         mode: str = 'none',
         logprobs: bool | None = False,
@@ -703,7 +703,7 @@ class OpenAISDK(OpenAI):
             self.openai_api_base = random.choice(openai_api_base)
         else:
             self.openai_api_base = openai_api_base
-        
+
         self.azure_endpoint = azure_endpoint
         self.azure_api_version = azure_api_version
 
@@ -787,6 +787,29 @@ class OpenAISDK(OpenAI):
         messages, max_out_len = self._preprocess_messages(
             input, max_out_len, self.max_seq_len, self.mode,
             self.get_token_len)
+
+        # Convert Chat Completions content part types to Responses API
+        # format: 'text' -> 'input_text', 'image_url' -> 'input_image'
+        for msg in messages:
+            if isinstance(msg.get('content'), list):
+                new_parts = []
+                for part in msg['content']:
+                    if part.get('type') == 'text':
+                        new_parts.append({
+                            'type': 'input_text',
+                            'text': part['text'],
+                        })
+                    elif part.get('type') == 'image_url':
+                        url = part['image_url']
+                        if isinstance(url, dict):
+                            url = url.get('url', '')
+                        new_parts.append({
+                            'type': 'input_image',
+                            'image_url': url,
+                        })
+                    else:
+                        new_parts.append(part)
+                msg['content'] = new_parts
 
         num_retries = 0
         while num_retries < self.retry:
@@ -995,7 +1018,7 @@ class OpenAISDKRollout(OpenAI):
                 azure_endpoint=self.azure_endpoint,
                 api_key=key if not self.azure_credential else None,
                 api_version=azure_api_version,
-                token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default") if self.azure_credential else None,
+                azure_ad_token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default") if self.azure_credential else None,
                 http_client=httpx.Client(
                     **http_client_cfg) if http_client_cfg else None,
             )
@@ -1041,6 +1064,29 @@ class OpenAISDKRollout(OpenAI):
         messages, max_out_len = self._preprocess_messages(
             input, max_out_len, self.max_seq_len, self.mode,
             self.get_token_len)
+
+        # Convert Chat Completions content part types to Responses API
+        # format: 'text' -> 'input_text', 'image_url' -> 'input_image'
+        for msg in messages:
+            if isinstance(msg.get('content'), list):
+                new_parts = []
+                for part in msg['content']:
+                    if part.get('type') == 'text':
+                        new_parts.append({
+                            'type': 'input_text',
+                            'text': part['text'],
+                        })
+                    elif part.get('type') == 'image_url':
+                        url = part['image_url']
+                        if isinstance(url, dict):
+                            url = url.get('url', '')
+                        new_parts.append({
+                            'type': 'input_image',
+                            'image_url': url,
+                        })
+                    else:
+                        new_parts.append(part)
+                msg['content'] = new_parts
 
         num_retries = 0
         while num_retries < self.retry:
